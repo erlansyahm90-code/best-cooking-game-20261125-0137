@@ -2,10 +2,15 @@
 // and the in-screenshot annotations. Everything is canvas vector shapes —
 // no image files. Text is kept big: the judge first sees the cover shrunk
 // to 768x480, so nothing that matters is small or low-contrast.
+//
+// Layout is the familiar mobile cooking game: order tickets on top, stations
+// in a tidy row, the chef walking between them — readable in 3 seconds.
 
-import { INGREDIENTS, PREP_BURNT, PREP_CHOPPED, PREP_COOKED, matchRecipe, recipeById } from './recipes.js';
-import { BURNERS, CRATES, PLATE_SLOTS, STATIONS } from './stations.js';
-import { formatClock, starsForCoins } from './timer.js';
+import { INGREDIENTS, PREP_BURNT, PREP_CHOPPED, PREP_COOKED, RECIPES, matchRecipe, recipeById } from './recipes.js';
+import { BURNERS, CRATES, PLATE_SLOTS, STATIONS, WARMING_SLOTS } from './stations.js';
+import { formatClock, starsForLevelCoins } from './levels.js';
+import { burnerCount, plateSlots, warmingSlots, UPGRADE_DEFS, canBuy, tierMinLevel } from './upgrades.js';
+import { patienceColor } from './orders.js';
 import { carryingLabel } from './chef.js';
 
 export const VIEW_W = 1280;
@@ -33,6 +38,7 @@ const C = {
   wood: '#8a5a33',
   woodLight: '#c89a6b',
   white: '#ffffff',
+  purple: '#8b5cf6',
 };
 
 function rr(ctx, x, y, w, h, r) {
@@ -138,6 +144,14 @@ export function drawIngredientIcon(ctx, id, x, y, r, prep = 'raw') {
       ctx.fill();
       ctx.restore();
     }
+  } else if (id === 'egg') {
+    // A fried-egg look: white oval with a golden yolk.
+    ctx.fillStyle = '#fff8e7';
+    ctx.beginPath();
+    ctx.ellipse(0, 0, r * 1.05, r * 0.8, 0.2, 0, Math.PI * 2);
+    ctx.fill();
+    circle(ctx, r * 0.1, 0, r * 0.5, '#f5a623');
+    circle(ctx, r * 0.1, 0, r * 0.3, '#ffc53d');
   }
   if (prep === PREP_CHOPPED) {
     // Chopped: two cut lines across the icon.
@@ -218,7 +232,9 @@ function drawPantry(ctx, state) {
   ctx.fill();
   text(ctx, 'PANTRY', s.x + s.w / 2, s.y - 8, 15, C.wood, 'center');
   CRATES.forEach((crate, i) => {
-    ctx.fillStyle = '#d9b380';
+    const ing = INGREDIENTS[crate.id];
+    const locked = ing.unlockLevel > state.level;
+    ctx.fillStyle = locked ? '#a08a6a' : '#d9b380';
     rr(ctx, crate.x, crate.y, crate.w, crate.h, 8);
     ctx.fill();
     const selected = state.pantrySelected === i;
@@ -226,11 +242,25 @@ function drawPantry(ctx, state) {
     ctx.lineWidth = selected ? 4 : 3;
     rr(ctx, crate.x, crate.y, crate.w, crate.h, 8);
     ctx.stroke();
-    drawIngredientIcon(ctx, crate.id, crate.x + crate.w / 2, crate.y + 40, 26);
-    text(ctx, INGREDIENTS[crate.id].name.toUpperCase(), crate.x + crate.w / 2, crate.y + crate.h - 10, 12, C.ink, 'center');
+    if (locked) {
+      ctx.globalAlpha = 0.45;
+      drawIngredientIcon(ctx, crate.id, crate.x + crate.w / 2, crate.y + 36, 24);
+      ctx.globalAlpha = 1;
+      text(ctx, `🔒 LV${ing.unlockLevel}`, crate.x + crate.w / 2, crate.y + crate.h - 10, 12, '#5a4632', 'center');
+    } else {
+      drawIngredientIcon(ctx, crate.id, crate.x + crate.w / 2, crate.y + 36, 24);
+      text(ctx, ing.name.toUpperCase(), crate.x + crate.w / 2, crate.y + crate.h - 10, 12, C.ink, 'center');
+    }
     text(ctx, `${i + 1}`, crate.x + 8, crate.y + 18, 12, selected ? C.gold : '#8a6a45');
   });
-  text(ctx, 'Keys 1–6 or click to choose', s.x + s.w / 2, s.y + s.h + 18, 11, C.wood, 'center', 'normal');
+  // Pantry grab progress ring over the selected crate.
+  if (state.grab) {
+    const crate = CRATES.find((c) => c.id === state.grab.crateId);
+    if (crate) {
+      ring(ctx, crate.x + crate.w / 2, crate.y + 36, 32, 'rgba(0,0,0,0.3)', 6);
+      ring(ctx, crate.x + crate.w / 2, crate.y + 36, 32, C.gold, 6, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (state.grab.t / state.grab.dur));
+    }
+  }
 }
 
 function drawBoardStation(ctx, state) {
@@ -272,10 +302,37 @@ function drawBoardStation(ctx, state) {
   } else {
     text(ctx, 'Drop a raw ingredient', s.x + s.w / 2, s.y + s.h / 2 + 5, 13, '#8a7a64', 'center', 'normal');
   }
+  // Knife tier pips.
+  const tier = state.upgrades.knife || 0;
+  for (let i = 0; i < 3; i++) {
+    circle(ctx, s.x + 24 + i * 14, s.y + 12, 5, i < tier ? C.gold : 'rgba(0,0,0,0.25)');
+  }
+  // Sous-chef helper, ready to chop: stands at the board's bottom-left
+  // corner so the stove never covers him.
+  if (state.helperReady) {
+    const hx = s.x + 20;
+    const hy = s.y + s.h - 8;
+    circle(ctx, hx, hy - 14, 14, '#f2c9a0');
+    ctx.fillStyle = '#fff';
+    rr(ctx, hx - 12, hy - 40, 24, 14, 6);
+    ctx.fill();
+    circle(ctx, hx - 8, hy - 40, 7, '#fff');
+    circle(ctx, hx + 8, hy - 40, 7, '#fff');
+    ctx.fillStyle = '#2c4a63';
+    rr(ctx, hx - 16, hy, 32, 20, 8);
+    ctx.fill();
+    const pulse = 0.6 + 0.4 * Math.sin(state.time * 5);
+    ctx.fillStyle = `rgba(46,158,91,${0.75 + 0.25 * pulse})`;
+    rr(ctx, hx - 34, hy - 66, 76, 22, 11);
+    ctx.fill();
+    text(ctx, 'H — CHOP!', hx + 4, hy - 51, 11, '#fff', 'center');
+  }
 }
 
 function drawStove(ctx, state) {
   const s = STATIONS.stove;
+  const stoveTier = state.upgrades.stove || 0;
+  const pots = burnerCount(state.upgrades);
   ctx.fillStyle = C.steel;
   rr(ctx, s.x, s.y, s.w, s.h, 10);
   ctx.fill();
@@ -283,9 +340,23 @@ function drawStove(ctx, state) {
   ctx.lineWidth = 3;
   rr(ctx, s.x, s.y, s.w, s.h, 10);
   ctx.stroke();
-  text(ctx, 'STOVE — 2 BURNERS', s.x + s.w / 2, s.y + s.h + 18, 14, C.steelDark, 'center');
-  state.pots.forEach((pot, i) => {
+  // Label inside the rect's top edge: the callout row above the stations
+  // would cover a label drawn above the rect.
+  text(ctx, `STOVE — ${pots} BURNER${pots > 1 ? 'S' : ''}`, s.x + s.w / 2, s.y + 16, 12, C.ink, 'center');
+  for (let i = 0; i < pots; i++) {
+    const pot = state.pots[i];
     const b = BURNERS[i];
+    // Flames under the pot: bigger at higher stove tiers.
+    const flameH = 12 + stoveTier * 5;
+    for (const fx of [-18, 0, 18]) {
+      ctx.fillStyle = i % 2 === 0 ? '#ff8c42' : '#ffb347';
+      ctx.beginPath();
+      ctx.moveTo(b.x + fx - 8, b.y + 52);
+      ctx.lineTo(b.x + fx, b.y + 52 - flameH - (fx === 0 ? 4 : 0));
+      ctx.lineTo(b.x + fx + 8, b.y + 52);
+      ctx.closePath();
+      ctx.fill();
+    }
     circle(ctx, b.x, b.y + 18, 46, '#3a3d42');
     ring(ctx, b.x, b.y + 18, 46, '#22252a', 4);
     // Pot body.
@@ -310,15 +381,36 @@ function drawStove(ctx, state) {
         ctx.quadraticCurveTo(b.x + 18 + wob, b.y - 52, b.x + 12 + wob, b.y - 66);
         ctx.stroke();
       }
-      // Progress ring around the pot.
+      // Progress ring: green PERFECT zone (0.7-1.0), gold progress,
+      // red overcook creep once it is done.
       ring(ctx, b.x, b.y + 6, 52, 'rgba(0,0,0,0.25)', 7);
+      ring(ctx, b.x, b.y + 6, 52, 'rgba(46,158,91,0.85)', 7, -Math.PI / 2 + Math.PI * 2 * 0.7, -Math.PI / 2 + Math.PI * 2);
       ring(ctx, b.x, b.y + 6, 52, pot.burnt ? '#111' : C.gold, 7, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * pot.progress);
-      if (pot.progress >= 1 && !pot.burnt) text(ctx, 'READY', b.x, b.y + 74, 13, C.green, 'center');
+      if (pot.progress >= 1 && !pot.burnt && (pot.overTime || 0) > 0) {
+        ring(ctx, b.x, b.y + 6, 52, C.red, 7, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.min(1, (pot.overTime || 0) / 8));
+      }
+      const perfect = !pot.burnt && pot.progress >= 0.7 && (pot.overTime || 0) <= 2;
+      if (pot.progress >= 1 && !pot.burnt) {
+        text(ctx, perfect ? '★ PERFECT' : 'READY', b.x, b.y + 74, 13, perfect ? C.gold : C.green, 'center');
+      }
       if (pot.burnt) text(ctx, 'BURNT!', b.x, b.y + 74, 13, C.red, 'center');
     } else {
       text(ctx, 'Empty burner', b.x, b.y + 74, 11, '#5a5e66', 'center', 'normal');
     }
-  });
+  }
+  // Locked third burner outline.
+  if (pots < 3) {
+    const b = BURNERS[2];
+    ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 4]);
+    circle(ctx, b.x, b.y + 18, 46, 'rgba(0,0,0,0)');
+    ctx.beginPath();
+    ctx.arc(b.x, b.y + 18, 46, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    text(ctx, '🔒 Stove Lv3', b.x, b.y + 74, 11, '#5a5e66', 'center', 'normal');
+  }
 }
 
 function drawPlate(ctx, state, slotIndex, x, y) {
@@ -353,10 +445,16 @@ function drawPlate(ctx, state, slotIndex, x, y) {
     ctx.fill();
     text(ctx, `${total}/${target}`, x, y + 60, 13, '#fff', 'center');
   }
+  // Plating arrange progress.
+  if (state.arrange && state.arrange.plate === plate) {
+    ring(ctx, x, y, 46, 'rgba(0,0,0,0.3)', 6);
+    ring(ctx, x, y, 46, C.gold, 6, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (state.arrange.t / state.arrange.dur));
+  }
 }
 
 function drawPlating(ctx, state) {
   const s = STATIONS.plating;
+  const slots = plateSlots(state.upgrades);
   ctx.fillStyle = '#efe9dc';
   rr(ctx, s.x, s.y, s.w, s.h, 10);
   ctx.fill();
@@ -365,8 +463,13 @@ function drawPlating(ctx, state) {
   rr(ctx, s.x, s.y, s.w, s.h, 10);
   ctx.stroke();
   text(ctx, 'PLATING COUNTER', s.x + s.w / 2, s.y + s.h + 18, 14, '#7a6a55', 'center');
-  PLATE_SLOTS.forEach((slot, i) => drawPlate(ctx, state, i, slot.x, slot.y));
-  text(ctx, '2 plates — assemble to match an order', s.x + s.w / 2, s.y + s.h - 8, 12, '#8a7a64', 'center', 'normal');
+  for (let i = 0; i < slots; i++) {
+    const slot = PLATE_SLOTS[i];
+    drawPlate(ctx, state, i, slot.x, slot.y);
+  }
+  if (slots === 2) {
+    text(ctx, '2 plates — assemble to match an order', s.x + s.w / 2, s.y + s.h - 8, 12, '#8a7a64', 'center', 'normal');
+  }
 }
 
 function drawWindowStation(ctx, state) {
@@ -403,6 +506,37 @@ function drawWindowStation(ctx, state) {
   text(ctx, 'NEXT TRAIN: ' + (state.orders[0] ? `No. ${state.orders[0].trainNo} → ${state.orders[0].dest}` : '—'), s.x + s.w / 2, s.y + s.h - 14, 12, '#ffe9a8', 'center');
 }
 
+function drawWarming(ctx, state) {
+  const s = STATIONS.warming;
+  const slots = warmingSlots(state.upgrades);
+  ctx.fillStyle = slots > 0 ? '#6b4a2f' : '#8a7a64';
+  rr(ctx, s.x, s.y, s.w, s.h, 8);
+  ctx.fill();
+  ctx.strokeStyle = '#4a3220';
+  ctx.lineWidth = 2;
+  rr(ctx, s.x, s.y, s.w, s.h, 8);
+  ctx.stroke();
+  // Heat-lamp glow.
+  if (slots > 0) {
+    ctx.fillStyle = 'rgba(255,180,80,0.35)';
+    rr(ctx, s.x + 8, s.y + 6, s.w - 16, 12, 6);
+    ctx.fill();
+  }
+  text(ctx, 'WARMING', s.x + 10, s.y + 24, 12, slots > 0 ? '#ffd9a0' : '#d9cdb8');
+  if (slots <= 0) {
+    text(ctx, '🔒 Buy in shop (U)', s.x + s.w - 10, s.y + 24, 11, '#d9cdb8', 'right', 'normal');
+    return;
+  }
+  for (let i = 0; i < slots; i++) {
+    const slot = WARMING_SLOTS[i];
+    circle(ctx, slot.x, slot.y, 20, 'rgba(255,255,255,0.14)');
+    ring(ctx, slot.x, slot.y, 20, '#c89a6b', 2);
+    const item = state.warming[i];
+    if (item) drawIngredientIcon(ctx, item.id, slot.x, slot.y, 14, item.prep);
+  }
+  text(ctx, `${state.warming.length}/${slots} — never burns`, s.x + s.w - 10, s.y + 24, 11, '#ffd9a0', 'right', 'normal');
+}
+
 function drawTrash(ctx) {
   const s = STATIONS.trash;
   ctx.fillStyle = '#5a5e66';
@@ -421,30 +555,40 @@ function drawOrderTicket(ctx, order, x, y, w, h, now) {
   ctx.fillStyle = flash ? '#5a1f1a' : '#1d4638';
   rr(ctx, x, y, w, h, 8);
   ctx.fill();
-  ctx.strokeStyle = urgent ? C.red : '#2e6b52';
-  ctx.lineWidth = urgent ? 3 : 2;
+  ctx.strokeStyle = order.express ? C.purple : urgent ? C.red : '#2e6b52';
+  ctx.lineWidth = order.express || urgent ? 3 : 2;
   rr(ctx, x, y, w, h, 8);
   ctx.stroke();
   text(ctx, `No. ${order.trainNo} → ${order.dest}`, x + 12, y + 20, 13, C.amber);
   text(ctx, order.name, x + 12, y + 42, 16, C.cream);
+  // Passenger / Express badge, top-right.
+  const badge = order.express ? 'EXP ×2' : order.passenger === 'vip' ? '★ VIP' : order.passenger === 'buru' ? '⚡ BURU' : null;
+  if (badge) {
+    ctx.font = `bold 11px ${FONT}`;
+    const bw = ctx.measureText(badge).width + 14;
+    ctx.fillStyle = order.express ? C.purple : order.passenger === 'vip' ? C.gold : '#ff8c42';
+    rr(ctx, x + w - bw - 8, y + 6, bw, 18, 9);
+    ctx.fill();
+    text(ctx, badge, x + w - 8 - bw / 2, y + 19, 11, order.passenger === 'vip' ? C.ink : '#fff', 'center');
+  }
   // Needed ingredients, with prep badges.
   const recipe = recipeById(order.recipeId);
   recipe.need.forEach(([id, prep], i) => {
     const ix = x + 26 + i * 44;
-    drawIngredientIcon(ctx, id, ix, y + 68, 14, prep);
-    prepBadge(ctx, prep, ix + 13, y + 54);
+    drawIngredientIcon(ctx, id, ix, y + 60, 12, prep);
+    prepBadge(ctx, prep, ix + 11, y + 48);
   });
-  // Timer bar + seconds.
+  // Patience bar + seconds.
   const frac = Math.max(0, order.timeLeft / order.total);
   const bw = w - 24;
   ctx.fillStyle = 'rgba(0,0,0,0.4)';
-  rr(ctx, x + 12, y + h - 26, bw, 12, 6);
+  rr(ctx, x + 12, y + h - 14, bw, 10, 5);
   ctx.fill();
-  ctx.fillStyle = urgent ? C.red : frac > 0.5 ? C.green : C.amber;
-  rr(ctx, x + 12, y + h - 26, bw * frac, 12, 6);
+  ctx.fillStyle = patienceColor(order);
+  rr(ctx, x + 12, y + h - 14, bw * frac, 10, 5);
   ctx.fill();
-  text(ctx, `${Math.ceil(order.timeLeft)}s`, x + w - 12, y + 20, 15, urgent ? '#ff8a80' : C.cream, 'right');
-  text(ctx, `${order.price}c`, x + w - 12, y + 44, 13, C.gold, 'right');
+  text(ctx, `${Math.ceil(order.timeLeft)}s`, x + w - 12, y + 62, 13, urgent ? '#ff8a80' : C.cream, 'right');
+  text(ctx, `${order.price}c`, x + w - 12, y + 42, 13, C.gold, 'right');
 }
 
 function drawOrderBoard(ctx, state) {
@@ -455,6 +599,7 @@ function drawOrderBoard(ctx, state) {
   ctx.fillRect(0, 156, VIEW_W, 4);
   text(ctx, 'DEPARTURES', 16, 82, 15, C.amber);
   text(ctx, 'Serve before the train leaves', 16, 102, 11, '#8fb8a4', 'left', 'normal');
+  text(ctx, 'Click a ticket: tea +12s (3c)', 1264, 102, 11, '#8fb8a4', 'right', 'normal');
   if (state.orders.length === 0) {
     text(ctx, 'No trains due — the next order is on its way…', 640, 122, 16, '#8fb8a4', 'center', 'normal');
     return;
@@ -475,31 +620,53 @@ function drawHud(ctx, state) {
   ctx.fillStyle = C.ink;
   ctx.fillRect(0, 0, VIEW_W, 56);
   text(ctx, 'JUNCTION KITCHEN', 16, 36, 22, C.cream);
-  text(ctx, 'a train-station kitchen', 258, 36, 13, '#b8a888', 'left', 'normal');
-  // Shift timer.
-  const left = Math.max(0, 180 - state.time);
-  text(ctx, 'SHIFT', 700, 22, 12, '#b8a888', 'center');
-  text(ctx, formatClock(left), 700, 46, 20, left <= 30 ? '#ff8a80' : C.cream, 'center');
-  // Coins + stars.
-  circle(ctx, 800, 28, 13, C.gold);
-  text(ctx, '¢', 800, 33, 14, C.ink, 'center');
-  text(ctx, `${state.coins}`, 822, 36, 20, C.cream);
-  const stars = starsForCoins(state.coins);
-  for (let i = 0; i < 3; i++) {
-    text(ctx, i < stars ? '★' : '☆', 900 + i * 26, 36, 20, i < stars ? C.gold : '#6a6258', 'center');
+  // Level badge: LV + name + time left in the level.
+  const cfg = state.levelCfg;
+  const left = Math.max(0, cfg.duration - state.levelTime);
+  ctx.fillStyle = '#7a2e2e';
+  rr(ctx, 258, 10, 168, 36, 18);
+  ctx.fill();
+  ctx.strokeStyle = C.gold;
+  ctx.lineWidth = 2;
+  rr(ctx, 258, 10, 168, 36, 18);
+  ctx.stroke();
+  text(ctx, `LV ${state.level} · ${cfg.name.toUpperCase()} · ${formatClock(left)}`, 342, 34, 14, '#ffe9a8', 'center');
+  // Goal meter: coins this level vs normal (tick) and expert (end).
+  text(ctx, 'GOAL', 446, 20, 11, '#b8a888');
+  const gx = 446;
+  const gw = 240;
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  rr(ctx, gx, 26, gw, 12, 6);
+  ctx.fill();
+  const frac = Math.min(1, state.levelCoins / cfg.goalExpert);
+  ctx.fillStyle = C.gold;
+  rr(ctx, gx, 26, gw * frac, 12, 6);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(gx + gw * (cfg.goalNormal / cfg.goalExpert) - 1, 24, 2, 16);
+  text(ctx, `${state.levelCoins}/${cfg.goalNormal}`, gx + gw + 8, 38, 14, C.cream);
+  const stars = starsForLevelCoins(state.levelCoins, state.level);
+  for (let i = 0; i < 5; i++) {
+    text(ctx, i < stars ? '★' : '☆', 762 + i * 20, 38, 16, i < stars ? C.gold : '#6a6258', 'center');
   }
+  // Bank coins.
+  circle(ctx, 892, 28, 13, C.gold);
+  text(ctx, '¢', 892, 33, 14, C.ink, 'center');
+  text(ctx, `${state.coins}`, 914, 36, 20, C.cream);
   // Combo.
   if (state.combo >= 2) {
     ctx.fillStyle = '#7a2e8f';
-    rr(ctx, 990, 12, 96, 32, 16);
+    rr(ctx, 972, 12, 96, 32, 16);
     ctx.fill();
-    text(ctx, `COMBO x${(1 + 0.25 * Math.min(state.combo, 4)).toFixed(2)}`, 1038, 34, 14, '#fff', 'center');
+    text(ctx, `COMBO x${(1 + 0.25 * Math.min(state.combo, 4)).toFixed(2)}`, 1020, 34, 14, '#fff', 'center');
   }
   // Reputation hearts.
   for (let i = 0; i < 5; i++) {
-    text(ctx, i < state.reputation ? '♥' : '♡', 1120 + i * 26, 36, 20, i < state.reputation ? C.red : '#6a6258', 'center');
+    text(ctx, i < state.reputation ? '♥' : '♡', 1100 + i * 22, 36, 18, i < state.reputation ? C.red : '#6a6258', 'center');
   }
-  text(ctx, 'REP', 1110, 14, 10, '#b8a888', 'center');
+  // Tea + helper.
+  text(ctx, `🍵${state.tea}`, 1220, 36, 15, state.tea > 0 ? '#8fd0a8' : '#6a6258', 'center');
+  if (state.helperReady) text(ctx, '👨‍🍳', 1256, 36, 15, '#fff', 'center');
 }
 
 function drawChef(ctx, state) {
@@ -534,24 +701,41 @@ function drawChef(ctx, state) {
   // Eyes look the way the chef faces.
   circle(ctx, x + chef.facing * 5 - 4, y - 24, 2.5, C.ink);
   circle(ctx, x + chef.facing * 5 + 5, y - 24, 2.5, C.ink);
-  // Carried item floats above the hat.
-  if (chef.carrying) {
-    if (chef.carrying.kind === 'ingredient') {
-      circle(ctx, x, y - 78, 20, 'rgba(255,246,224,0.95)');
-      ring(ctx, x, y - 78, 20, C.amberDim, 2);
-      drawIngredientIcon(ctx, chef.carrying.id, x, y - 78, 14, chef.carrying.prep);
+  // Two carried items float above the hat (two hands).
+  chef.hands.forEach((item, i) => {
+    const hx = x + (i === 0 ? -22 : 22);
+    const hy = y - 78;
+    if (!item) {
+      ctx.strokeStyle = 'rgba(255,246,224,0.4)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.arc(hx, hy, 18, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      return;
+    }
+    if (item.kind === 'ingredient') {
+      circle(ctx, hx, hy, 20, 'rgba(255,246,224,0.95)');
+      ring(ctx, hx, hy, 20, i === 0 ? C.amberDim : '#7a2e8f', 2);
+      drawIngredientIcon(ctx, item.id, hx, hy, 14, item.prep);
     } else {
-      circle(ctx, x, y - 78, 22, '#f4efe4');
-      ring(ctx, x, y - 78, 22, '#c9c2b2', 2);
-      chef.carrying.plate.items.forEach((item, i) => {
-        const n = chef.carrying.plate.items.length;
-        const ang = (i / Math.max(n, 1)) * Math.PI * 2 - Math.PI / 2;
-        drawIngredientIcon(ctx, item.id, x + Math.cos(ang) * 10, y - 78 + Math.sin(ang) * 10, 8, item.prep);
+      circle(ctx, hx, hy, 22, '#f4efe4');
+      ring(ctx, hx, hy, 22, i === 0 ? '#c9c2b2' : '#7a2e8f', 2);
+      item.plate.items.forEach((it, j) => {
+        const n = item.plate.items.length;
+        const ang = (j / Math.max(n, 1)) * Math.PI * 2 - Math.PI / 2;
+        drawIngredientIcon(ctx, it.id, hx + Math.cos(ang) * 10, hy + Math.sin(ang) * 10, 8, it.prep);
       });
     }
+  });
+  // Pantry grab progress ring over the chef.
+  if (state.grab) {
+    ring(ctx, x, y - 30, 30, 'rgba(0,0,0,0.3)', 5);
+    ring(ctx, x, y - 30, 30, C.gold, 5, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * (state.grab.t / state.grab.dur));
   }
   // Interaction prompt.
-  if (state.nearStation && state.screen === 'play') {
+  if (state.nearStation && state.screen === 'play' && !state.overlay) {
     const label = promptFor(state);
     ctx.fillStyle = 'rgba(20,52,43,0.92)';
     const w = ctx.measureText(label).width + 90;
@@ -563,8 +747,8 @@ function drawChef(ctx, state) {
 
 function promptFor(state) {
   const id = state.nearStation.id;
-  const carrying = state.chef.carrying;
-  if (id === 'pantry') return carrying ? 'Hands full' : 'Take an ingredient';
+  const carrying = state.chef.hands[0] || state.chef.hands[1];
+  if (id === 'pantry') return carrying && state.chef.hands[0] && state.chef.hands[1] ? 'Hands full' : 'Take an ingredient';
   if (id === 'board') {
     if (state.board.item) return state.board.progress >= 1 ? 'Take chopped' : 'Chopping…';
     return carrying && carrying.kind === 'ingredient' ? 'Place to chop' : 'Needs an ingredient';
@@ -580,6 +764,7 @@ function promptFor(state) {
     return 'Take a plate';
   }
   if (id === 'window') return carrying && carrying.kind === 'plate' ? 'Serve the plate' : 'Bring a finished plate';
+  if (id === 'warming') return carrying && carrying.kind === 'ingredient' ? 'Keep it warm' : 'Take from the rack';
   if (id === 'trash') return 'Throw it away';
   return id;
 }
@@ -589,13 +774,33 @@ function drawBottomBar(ctx, state) {
   ctx.fillRect(0, 660, VIEW_W, 60);
   text(ctx, 'WASD / arrows — move', 16, 684, 13, '#cfc4ae', 'left', 'normal');
   text(ctx, 'E or click — work a station', 16, 704, 13, '#cfc4ae', 'left', 'normal');
-  text(ctx, 'T — recipes', 250, 684, 13, '#cfc4ae', 'left', 'normal');
-  text(ctx, '1–6 — pick pantry crate', 250, 704, 13, '#cfc4ae', 'left', 'normal');
-  // Carried item.
-  text(ctx, 'CARRYING', 420, 682, 11, '#b8a888');
-  text(ctx, carryingLabel(state.chef.carrying), 420, 704, 15, C.cream);
-  // Rush indicator.
-  text(ctx, `RUSH Lv.${state.rush}`, 1210, 684, 13, state.rush >= 3 ? '#ff8a80' : C.gold, 'right');
+  text(ctx, 'T — recipe book', 250, 684, 13, '#cfc4ae', 'left', 'normal');
+  text(ctx, '1–7 — pick pantry crate', 250, 704, 13, '#cfc4ae', 'left', 'normal');
+  // Two hand slots.
+  text(ctx, 'HANDS', 420, 682, 11, '#b8a888');
+  state.chef.hands.forEach((item, i) => {
+    const hx = 470 + i * 52;
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    rr(ctx, hx, 668, 44, 44, 8);
+    ctx.fill();
+    ctx.strokeStyle = i === 0 ? C.gold : '#7a2e8f';
+    ctx.lineWidth = 2;
+    rr(ctx, hx, 668, 44, 44, 8);
+    ctx.stroke();
+    if (item && item.kind === 'ingredient') drawIngredientIcon(ctx, item.id, hx + 22, 690, 13, item.prep);
+    if (item && item.kind === 'plate') {
+      circle(ctx, hx + 22, 690, 14, '#f4efe4');
+      item.plate.items.forEach((it, j) => {
+        const n = item.plate.items.length;
+        const ang = (j / Math.max(n, 1)) * Math.PI * 2 - Math.PI / 2;
+        drawIngredientIcon(ctx, it.id, hx + 22 + Math.cos(ang) * 7, 690 + Math.sin(ang) * 7, 6, it.prep);
+      });
+    }
+  });
+  text(ctx, 'Q swap · C tea · H helper · U shop', 590, 684, 13, '#cfc4ae', 'left', 'normal');
+  text(ctx, carryingLabel(state.chef), 590, 704, 12, '#8fb8a4', 'left', 'normal');
+  // Level + score.
+  text(ctx, `LV ${state.level} · ${state.levelCfg.name}`, 1210, 684, 13, C.gold, 'right');
   text(ctx, `Served ${state.served} · Missed ${state.missed}`, 1210, 704, 12, '#cfc4ae', 'right', 'normal');
 }
 
@@ -623,6 +828,15 @@ function drawPopups(ctx, state) {
     const a = Math.max(0, 1 - p.t / 1.4);
     ctx.globalAlpha = a;
     text(ctx, p.text, p.x, p.y - p.t * 34, 20, p.color || C.gold, 'center');
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawParticles(ctx, state) {
+  for (const pt of state.particles) {
+    const a = Math.max(0, 1 - pt.t / pt.life);
+    ctx.globalAlpha = a;
+    circle(ctx, pt.x, pt.y, 3.5, pt.color);
     ctx.globalAlpha = 1;
   }
 }
@@ -677,19 +891,19 @@ export function drawAnnotations(ctx, state, scene) {
   text(ctx, 'HOW THE KITCHEN WORKS', lx + 14, ly + 22, 13, C.gold);
   text(ctx, '1 · Orders are trains — serve before departure.', lx + 14, ly + 46, 12, '#fff', 'left', 'normal');
   text(ctx, '2 · Chop raw, cook in a pot, plate to match.', lx + 14, ly + 68, 12, '#fff', 'left', 'normal');
-  text(ctx, '3 · Early serves pay a tip; streaks raise combo.', lx + 300, ly + 46, 12, '#fff', 'left', 'normal');
-  text(ctx, '4 · Miss a train and the station loses a heart.', lx + 300, ly + 68, 12, '#fff', 'left', 'normal');
+  text(ctx, '3 · Serve early, earn tips, grow combo.', lx + 300, ly + 46, 12, '#fff', 'left', 'normal');
+  text(ctx, '4 · Level up to unlock recipes + shop.', lx + 300, ly + 68, 12, '#fff', 'left', 'normal');
   if (scene === 'cover') {
     callout(ctx, 'ORDER BOARD: 3 trains waiting', 330, 168, 430, 110);
-    callout(ctx, 'Pots cooking, timers running', 360, 430, 600, 290);
+    callout(ctx, 'Pots cooking — green zone = PERFECT', 280, 440, 600, 290);
     callout(ctx, 'MID-ASSEMBLY: 2 of 3', 690, 420, 792, 310);
-    callout(ctx, 'READY plate — serve it now', 960, 420, 892, 310);
+    callout(ctx, 'READY plate — serve it now', 700, 470, 892, 310);
   } else if (scene === 'chop') {
     callout(ctx, 'Chopping: progress fills while you stay', 520, 380, 362, 280);
     callout(ctx, 'Chopped tomato feeds 3 recipes', 700, 480, 850, 300);
   } else if (scene === 'stove') {
-    callout(ctx, 'Two burners, two pots at once', 480, 400, 600, 280);
-    callout(ctx, '5s left — this train is about to go', 430, 172, 500, 110);
+    callout(ctx, 'Three burners at stove Lv3', 480, 400, 600, 280);
+    callout(ctx, 'EXPRESS: 5s left — this train is about to go', 430, 164, 500, 110);
   } else if (scene === 'serve') {
     callout(ctx, 'Served! Tip + combo pay out', 760, 280, 1130, 330);
     callout(ctx, 'Next train already pulling in', 700, 172, 1080, 280);
@@ -712,15 +926,15 @@ function drawTitle(ctx, state) {
   text(ctx, 'JUNCTION KITCHEN', 640, 168, 54, C.amber, 'center');
   text(ctx, 'A COOKING GAME AT THE TRAIN JUNCTION', 640, 210, 18, C.cream, 'center');
   text(ctx, 'Orders arrive as trains. Chop, cook, plate — and serve before departure.', 640, 290, 17, '#cfe3d6', 'center', 'normal');
-  text(ctx, '6 recipes · 2 burners · 3-minute shifts · combos pay extra', 640, 322, 15, '#8fb8a4', 'center', 'normal');
+  text(ctx, '7 recipes · 5 levels · 8 upgrades · combos pay extra', 640, 322, 15, '#8fb8a4', 'center', 'normal');
   // Mini recipe strip.
-  const names = ['Tomato Pasta', 'Margherita', 'Mushroom Soup', 'Garden Salad', 'Cheese Melt', 'Golden Risotto'];
+  const names = ['Tomato Pasta', 'Garden Salad', 'Cheese Melt', 'Mushroom Soup', 'Margherita', 'Golden Risotto', 'Midnight Omelette'];
   names.forEach((name, i) => {
-    const x = 190 + i * 150;
+    const x = 160 + i * 138;
     ctx.fillStyle = '#1d4638';
-    rr(ctx, x, 360, 138, 44, 8);
+    rr(ctx, x, 360, 132, 44, 8);
     ctx.fill();
-    text(ctx, name, x + 69, 388, 13, C.cream, 'center');
+    text(ctx, name, x + 66, 387, 12, C.cream, 'center');
   });
   const blink = Math.floor(state.time * 1.5) % 2 === 0;
   if (blink) text(ctx, 'PRESS ENTER OR CLICK TO START YOUR SHIFT', 640, 480, 20, C.gold, 'center');
@@ -731,45 +945,110 @@ function drawTitle(ctx, state) {
 function drawEnd(ctx, state) {
   ctx.fillStyle = 'rgba(12,35,29,0.88)';
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  const totalStars = state.stars.reduce((a, b) => a + (b || 0), 0);
   const won = state.reputation > 0;
-  text(ctx, won ? 'SHIFT COMPLETE' : 'STATION CLOSED', 640, 150, 44, won ? C.gold : '#ff8a80', 'center');
-  const stars = starsForCoins(state.coins);
-  for (let i = 0; i < 3; i++) {
-    text(ctx, i < stars ? '★' : '☆', 580 + i * 60, 230, 48, i < stars ? C.gold : '#4a5a50', 'center');
-  }
-  text(ctx, `${state.coins} coins earned`, 640, 300, 26, C.cream, 'center');
-  text(ctx, `${state.served} dishes served · ${state.missed} trains missed · best combo x${(1 + 0.25 * Math.min(state.bestCombo, 4)).toFixed(2)}`, 640, 340, 16, '#cfe3d6', 'center', 'normal');
-  text(ctx, stars === 3 ? 'Three stars — the junction runs on your cooking.' : stars === 2 ? 'Two stars — solid service. One more push for three.' : stars === 1 ? 'One star — the trains kept coming. Try a faster route.' : 'No stars yet — chop first, cook second, serve early.', 640, 380, 15, '#8fb8a4', 'center', 'normal');
+  text(ctx, won ? 'ALL SHIFTS COMPLETE' : 'STATION CLOSED', 640, 120, 44, won ? C.gold : '#ff8a80', 'center');
+  // Stars per level.
+  state.stars.forEach((s, i) => {
+    const x = 640 - (state.stars.length - 1) * 90 + i * 180;
+    text(ctx, `LV ${i + 1}`, x, 190, 16, C.cream, 'center');
+    for (let j = 0; j < 5; j++) {
+      text(ctx, j < (s || 0) ? '★' : '☆', x - 40 + j * 20, 224, 18, j < (s || 0) ? C.gold : '#4a5a50', 'center');
+    }
+  });
+  text(ctx, `${totalStars} / ${state.stars.length * 5} stars`, 640, 280, 26, C.cream, 'center');
+  text(ctx, `${state.coins} coins earned`, 640, 320, 22, C.gold, 'center');
+  text(ctx, `${state.served} dishes served · ${state.missed} trains missed · best combo x${(1 + 0.25 * Math.min(state.bestCombo, 4)).toFixed(2)}`, 640, 360, 16, '#cfe3d6', 'center', 'normal');
+  text(ctx, totalStars >= 20 ? 'Five-star kitchen — the junction runs on your cooking.' : totalStars >= 12 ? 'Solid service. One more push for the full five stars.' : 'The trains kept coming. Chop first, cook second, serve early.', 640, 400, 15, '#8fb8a4', 'center', 'normal');
   const blink = Math.floor(state.time * 1.5) % 2 === 0;
-  if (blink) text(ctx, 'PRESS R TO RUN THE NEXT SHIFT', 640, 470, 20, C.gold, 'center');
+  if (blink) text(ctx, 'PRESS R TO RUN THE NEXT SHIFT', 640, 480, 20, C.gold, 'center');
 }
 
 function drawMenuOverlay(ctx, state) {
   ctx.fillStyle = 'rgba(12,35,29,0.9)';
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-  text(ctx, 'THE MENU — 6 DISHES', 640, 90, 28, C.gold, 'center');
-  const recipes = [
-    ['Tomato Pasta', 12, [['dough', 'raw'], ['tomato', 'cooked']]],
-    ['Margherita', 14, [['dough', 'raw'], ['tomato', 'chopped'], ['cheese', 'raw']]],
-    ['Mushroom Soup', 15, [['mushroom', 'cooked'], ['onion', 'cooked']]],
-    ['Garden Salad', 10, [['tomato', 'chopped'], ['onion', 'chopped'], ['basil', 'raw']]],
-    ['Cheese Melt', 11, [['dough', 'raw'], ['cheese', 'cooked']]],
-    ['Golden Risotto', 16, [['mushroom', 'cooked'], ['onion', 'chopped'], ['basil', 'raw']]],
-  ];
-  recipes.forEach(([name, price, need], i) => {
-    const y = 140 + i * 80;
+  text(ctx, 'THE RECIPE BOOK — 7 DISHES', 640, 80, 28, C.gold, 'center');
+  text(ctx, 'Locked dishes open as you level up', 640, 108, 14, '#8fb8a4', 'center', 'normal');
+  RECIPES.forEach((recipe, i) => {
+    const y = 132 + i * 72;
+    const locked = recipe.unlockLevel > state.level;
+    ctx.globalAlpha = locked ? 0.45 : 1;
     ctx.fillStyle = '#1d4638';
-    rr(ctx, 240, y, 800, 64, 10);
+    rr(ctx, 240, y, 800, 60, 10);
     ctx.fill();
-    text(ctx, name, 260, y + 40, 20, C.cream);
-    need.forEach(([id, prep], j) => {
+    text(ctx, recipe.name, 260, y + 38, 20, C.cream);
+    text(ctx, locked ? `🔒 LV ${recipe.unlockLevel}` : `LV ${recipe.unlockLevel}`, 560, y + 38, 14, locked ? '#ff8a80' : '#8fb8a4');
+    recipe.need.forEach(([id, prep], j) => {
       const ix = 700 + j * 90;
-      drawIngredientIcon(ctx, id, ix, y + 32, 18, prep);
-      prepBadge(ctx, prep, ix + 16, y + 14);
+      drawIngredientIcon(ctx, id, ix, y + 30, 18, prep);
+      prepBadge(ctx, prep, ix + 16, y + 12);
     });
-    text(ctx, `${price}c`, 1000, y + 40, 18, C.gold, 'right');
+    text(ctx, `${recipe.price}c`, 1000, y + 38, 18, C.gold, 'right');
+    ctx.globalAlpha = 1;
   });
-  text(ctx, 'Press T or click to close', 640, 650, 15, '#8fb8a4', 'center', 'normal');
+  text(ctx, 'Press T or click to close', 640, 660, 15, '#8fb8a4', 'center', 'normal');
+}
+
+function drawLevelUpOverlay(ctx, state) {
+  const lu = state.levelUp;
+  if (!lu) return;
+  ctx.fillStyle = 'rgba(12,35,29,0.92)';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  text(ctx, 'LEVEL UP!', 640, 150, 52, C.gold, 'center');
+  text(ctx, `LEVEL ${lu.level} — ${levelName(lu.level).toUpperCase()}`, 640, 210, 28, C.cream, 'center');
+  for (let i = 0; i < 5; i++) {
+    text(ctx, i < lu.stars ? '★' : '☆', 540 + i * 50, 290, 44, i < lu.stars ? C.gold : '#4a5a50', 'center');
+  }
+  text(ctx, `${lu.stars} / 5 stars · ${lu.coins} coins earned this level`, 640, 340, 20, C.cream, 'center');
+  if (lu.unlocks.length > 0) {
+    text(ctx, `Unlocks: ${lu.unlocks.join(' · ')}`, 640, 390, 18, '#8fd0a8', 'center');
+  }
+  const blink = Math.floor(state.time * 1.5) % 2 === 0;
+  if (blink) text(ctx, 'PRESS ENTER — OPEN THE SHOP', 640, 480, 22, C.gold, 'center');
+  text(ctx, 'Spend your coins on upgrades, then run the next level.', 640, 530, 15, '#8fb8a4', 'center', 'normal');
+}
+
+function levelName(level) {
+  return ['Pagi', 'Siang', 'Sore', 'Malam', 'Tengah Malam'][level - 1] || '';
+}
+
+function drawShopOverlay(ctx, state) {
+  ctx.fillStyle = 'rgba(12,35,29,0.94)';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  text(ctx, 'TOKO UPGRADE', 640, 70, 32, C.gold, 'center');
+  circle(ctx, 1080, 56, 14, C.gold);
+  text(ctx, '¢', 1080, 61, 15, C.ink, 'center');
+  text(ctx, `${state.coins} coins`, 1102, 62, 20, C.cream);
+  UPGRADE_DEFS.forEach((def, i) => {
+    const y = 100 + i * 66;
+    const tier = state.upgrades[def.id] || 0;
+    const why = canBuy(state.upgrades, def.id, state.level, state.coins);
+    const maxed = tier >= 3;
+    ctx.globalAlpha = why === 'ok' || maxed ? 1 : 0.5;
+    ctx.fillStyle = '#1d4638';
+    rr(ctx, 180, y, 920, 56, 10);
+    ctx.fill();
+    text(ctx, `${i + 1}`, 206, y + 36, 20, C.amber);
+    text(ctx, def.name, 240, y + 28, 18, C.cream);
+    text(ctx, def.blurb, 240, y + 48, 13, '#8fb8a4', 'left', 'normal');
+    // Tier pips.
+    for (let t = 0; t < 3; t++) {
+      circle(ctx, 640 + t * 22, y + 28, 8, t < tier ? C.gold : 'rgba(255,255,255,0.2)');
+    }
+    text(ctx, def.effect(tier), 740, y + 36, 14, '#cfe3d6');
+    if (maxed) {
+      text(ctx, 'MAX', 1040, y + 36, 16, C.gold, 'right');
+    } else if (why === 'ok') {
+      text(ctx, `${def.costs[tier]}c — BUY`, 1040, y + 36, 16, C.green, 'right');
+    } else {
+      text(ctx, why, 1040, y + 36, 14, '#ff8a80', 'right');
+    }
+    ctx.globalAlpha = 1;
+  });
+  const next = state.shopFromLevelUp ? `ENTER — start LEVEL ${state.level + 1}` : 'ENTER — back to work';
+  const blink = Math.floor(state.time * 1.5) % 2 === 0;
+  if (blink) text(ctx, next, 640, 660, 20, C.gold, 'center');
+  text(ctx, 'Tier 2 needs LV2 · Tier 3 needs LV4', 640, 690, 13, '#8fb8a4', 'center', 'normal');
 }
 
 // ---------------------------------------------------------------- main draw
@@ -787,14 +1066,18 @@ export function drawGame(ctx, state) {
   drawStove(ctx, state);
   drawPlating(ctx, state);
   drawWindowStation(ctx, state);
+  drawWarming(ctx, state);
   drawTrash(ctx);
   drawChef(ctx, state);
   drawOrderBoard(ctx, state);
   drawHud(ctx, state);
   drawBottomBar(ctx, state);
   drawMessagePill(ctx, state);
+  drawParticles(ctx, state);
   drawPopups(ctx, state);
   if (state.scene) drawAnnotations(ctx, state, state.scene);
-  if (state.showMenu) drawMenuOverlay(ctx, state);
+  if (state.overlay === 'menu') drawMenuOverlay(ctx, state);
+  if (state.overlay === 'levelup') drawLevelUpOverlay(ctx, state);
+  if (state.overlay === 'shop') drawShopOverlay(ctx, state);
   if (state.screen === 'end') drawEnd(ctx, state);
 }
